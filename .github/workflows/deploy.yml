@@ -1,0 +1,208 @@
+name: Deploy
+
+# Brings the DMS pipelines up against source-app's database and down afterwards. Runs
+# only from main, in the "prod" GitHub Environment (your approval), with the OIDC
+# deploy role. source-app must be up first, and this repo must go down before it.
+on:
+  workflow_dispatch:
+    inputs:
+      action:
+        description: "up: apply, prepare the database, start both DMS tasks and the merge schedule. down: stop, clean the database, destroy"
+        type: choice
+        options: [up, down]
+        default: up
+
+concurrency:
+  group: cdc-iceberg-bench-prod
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  id-token: write
+
+env:
+  TF_DIR: infra/envs/prod
+  CONTRACT: /source-app/prod
+  CONTRACT_VERSION: "4"
+
+jobs:
+  up:
+    if: inputs.action == 'up' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    environment: prod
+    steps:
+      - uses: actions/checkout@v6
+      - uses: hashicorp/setup-terraform@v4
+        with:
+          terraform_version: 1.17.1
+          terraform_wrapper: false
+      - uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION || 'us-east-1' }}
+          role-duration-seconds: 7200
+
+      - name: Check that source-app is up with the expected contract
+        run: |
+          version=$(aws ssm get-parameter --name "$CONTRACT/contract_version" --query Parameter.Value --output text 2>/dev/null || echo none)
+          if [ "$version" != "$CONTRACT_VERSION" ]; then
+            echo "::error::source-app contract is '$version' (want $CONTRACT_VERSION). Bring source-app up first (its Deploy workflow)."
+            exit 1
+          fi
+
+      - name: Plan
+        working-directory: ${{ env.TF_DIR }}
+        run: |
+          terraform init -input=false
+          terraform plan -input=false -no-color -lock-timeout=120s -out tfplan | tee plan.log
+          { echo '### Plan'; echo '```'; tail -c 60000 plan.log; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Apply
+        working-directory: ${{ env.TF_DIR }}
+        run: terraform apply -input=false -lock-timeout=120s tfplan
+
+      - name: Read the outputs
+        working-directory: ${{ env.TF_DIR }}
+        run: terraform output -json > "$RUNNER_TEMP/outputs.json"
+
+      # Creates the DMS user (password from the secret DMS reads) and its schema.
+      - name: Run db-setup
+        run: ./scripts/run-ops.sh db-setup "$RUNNER_TEMP/outputs.json"
+
+      - name: Test the DMS endpoints
+        run: |
+          out="$RUNNER_TEMP/outputs.json"
+          instance=$(jq -r .dms.value.replication_instance_arn "$out")
+          for endpoint in $(jq -r '.dms.value.endpoint_arns[]' "$out"); do
+            aws dms test-connection --replication-instance-arn "$instance" --endpoint-arn "$endpoint" >/dev/null 2>&1 || true
+            if ! aws dms wait test-connection-succeeds \
+              --filters "Name=endpoint-arn,Values=$endpoint" "Name=replication-instance-arn,Values=$instance"; then
+              aws dms describe-connections --filters "Name=endpoint-arn,Values=$endpoint" \
+                --query 'Connections[0].[Status,LastFailureMessage]' --output text
+              echo "::error::DMS can't connect to $endpoint"
+              exit 1
+            fi
+            echo "ok: $endpoint"
+          done
+
+      - name: Start both DMS tasks
+        run: |
+          out="$RUNNER_TEMP/outputs.json"
+          for task in $(jq -r '.dms.value.task_arns[]' "$out"); do
+            status=$(aws dms describe-replication-tasks --filters "Name=replication-task-arn,Values=$task" \
+              --query 'ReplicationTasks[0].Status' --output text)
+            case "$status" in
+              running) echo "already running: $task"; continue ;;
+              ready) type=start-replication ;;
+              *) type=resume-processing ;;
+            esac
+            aws dms start-replication-task --replication-task-arn "$task" --start-replication-task-type "$type" >/dev/null
+            aws dms wait replication-task-running --filters "Name=replication-task-arn,Values=$task"
+            echo "running ($type): $task"
+          done
+
+      # The merge job's first run must see the whole full load, so it waits for it.
+      - name: Wait for the dms_batch full load
+        run: |
+          task=$(jq -r .dms.value.task_arns.dms_batch "$RUNNER_TEMP/outputs.json")
+          for _ in $(seq 1 120); do
+            progress=$(aws dms describe-replication-tasks --filters "Name=replication-task-arn,Values=$task" \
+              --query 'ReplicationTasks[0].ReplicationTaskStats.FullLoadProgressPercent' --output text)
+            echo "full load: ${progress}%"
+            [ "$progress" = 100 ] && exit 0
+            sleep 30
+          done
+          echo "::error::The dms_batch full load didn't finish within an hour"
+          exit 1
+
+      - name: Run the merge job once, then schedule it
+        run: |
+          out="$RUNNER_TEMP/outputs.json"
+          job=$(jq -r .dms_batch.value.glue_job "$out")
+          trigger=$(jq -r .dms_batch.value.glue_trigger "$out")
+          # DMS closes the last CDC file of the full load after its batch interval.
+          sleep 90
+          run=$(aws glue start-job-run --job-name "$job" --query JobRunId --output text)
+          while true; do
+            state=$(aws glue get-job-run --job-name "$job" --run-id "$run" --query JobRun.JobRunState --output text)
+            echo "merge job: $state"
+            case "$state" in
+              SUCCEEDED) break ;;
+              FAILED|ERROR|TIMEOUT|STOPPED)
+                aws glue get-job-run --job-name "$job" --run-id "$run" --query JobRun.ErrorMessage --output text
+                exit 1 ;;
+            esac
+            sleep 20
+          done
+          aws glue start-trigger --name "$trigger" >/dev/null
+          echo "scheduled: $trigger"
+
+      - name: Summary
+        run: |
+          out="$RUNNER_TEMP/outputs.json"
+          {
+            echo "### cdc-iceberg-bench is up"
+            echo "- Athena workgroup: \`$(jq -r .lake.value.athena_workgroup "$out")\`"
+            echo "- dms_stream: \`$(jq -r '.lake.value.databases.dms_stream | [.bronze, .silver] | join("`, `")' "$out")\`"
+            echo "- dms_batch: \`$(jq -r '.lake.value.databases.dms_batch | [.bronze, .silver] | join("`, `")' "$out")\`"
+            echo "- Source row counts: \`make source-counts\` (with \`AWS_PROFILE\` set)"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  down:
+    if: inputs.action == 'down' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    environment: prod
+    steps:
+      - uses: actions/checkout@v6
+      - uses: hashicorp/setup-terraform@v4
+        with:
+          terraform_version: 1.17.1
+          terraform_wrapper: false
+      - uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION || 'us-east-1' }}
+          role-duration-seconds: 7200
+
+      - name: Read the outputs
+        working-directory: ${{ env.TF_DIR }}
+        run: |
+          terraform init -input=false
+          terraform output -json > "$RUNNER_TEMP/outputs.json"
+          if [ "$(jq 'has("dms")' "$RUNNER_TEMP/outputs.json")" != true ]; then
+            echo "Nothing deployed: skipping the stop and cleanup steps."
+            echo "DEPLOYED=false" >> "$GITHUB_ENV"
+          else
+            echo "DEPLOYED=true" >> "$GITHUB_ENV"
+          fi
+
+      - name: Stop the merge schedule and both DMS tasks
+        if: env.DEPLOYED == 'true'
+        run: |
+          out="$RUNNER_TEMP/outputs.json"
+          aws glue stop-trigger --name "$(jq -r .dms_batch.value.glue_trigger "$out")" >/dev/null 2>&1 || true
+          for task in $(jq -r '.dms.value.task_arns[]' "$out"); do
+            status=$(aws dms describe-replication-tasks --filters "Name=replication-task-arn,Values=$task" \
+              --query 'ReplicationTasks[0].Status' --output text)
+            if [ "$status" = running ] || [ "$status" = starting ]; then
+              aws dms stop-replication-task --replication-task-arn "$task" >/dev/null
+              aws dms wait replication-task-stopped --filters "Name=replication-task-arn,Values=$task"
+            fi
+            echo "$status → stopped: $task"
+          done
+
+      # Drops the DMS replication slots (a slot nobody reads fills the RDS disk), the
+      # DMS user and its schema. Fails if a slot is still active.
+      - name: Run db-teardown
+        if: env.DEPLOYED == 'true'
+        run: ./scripts/run-ops.sh db-teardown "$RUNNER_TEMP/outputs.json"
+
+      - name: Plan the destroy
+        working-directory: ${{ env.TF_DIR }}
+        run: |
+          terraform plan -destroy -input=false -no-color -lock-timeout=120s -out tfplan | tee plan.log
+          { echo '### Destroy plan'; echo '```'; tail -c 60000 plan.log; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Destroy
+        working-directory: ${{ env.TF_DIR }}
+        run: terraform apply -input=false -lock-timeout=120s tfplan
